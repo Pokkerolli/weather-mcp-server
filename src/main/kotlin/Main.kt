@@ -17,21 +17,338 @@ import io.modelcontextprotocol.kotlin.sdk.types.McpJson
 import io.modelcontextprotocol.kotlin.sdk.types.ServerCapabilities
 import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.double
-import kotlinx.serialization.json.int
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.doubleOrNull
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 
-val httpClient = HttpClient(ClientCIO)
+private val httpClient = HttpClient(ClientCIO)
 
-val json = Json { ignoreUnknownKeys = true }
+private val json = Json {
+    ignoreUnknownKeys = true
+    prettyPrint = true
+}
 
-fun weatherCodeToDescription(code: Int): String = when (code) {
+fun main() {
+    val host = System.getenv("MCP_HOST")?.trim()?.ifBlank { null } ?: "127.0.0.1"
+    val port = System.getenv("MCP_PORT")
+        ?.trim()
+        ?.toIntOrNull()
+        ?.takeIf { it in 1..65535 }
+        ?: 3001
+
+    println("Starting Weather MCP Server on http://$host:$port/mcp")
+
+    embeddedServer(CIO, host = host, port = port) {
+        install(ContentNegotiation) { json(McpJson) }
+        mcpStreamableHttp { createServer() }
+    }.start(wait = true)
+}
+
+private fun createServer(): Server {
+    val server = Server(
+        Implementation(
+            name = "weather-mcp-server",
+            version = "2.0.0",
+        ),
+        ServerOptions(
+            capabilities = ServerCapabilities(
+                tools = ServerCapabilities.Tools(listChanged = false),
+            ),
+        ),
+    )
+
+    addSearchLocationTool(server)
+    addGetForecastTool(server)
+    addGetCityForecastTool(server)
+
+    return server
+}
+
+private fun addSearchLocationTool(server: Server) {
+    server.addTool(
+        name = "search_location",
+        description = "Search for a city by name and return structured location candidates with coordinates. " +
+            "Use this if you need to resolve a city before requesting a forecast.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("name") {
+                    put("type", "string")
+                    put("description", "City name to search for")
+                }
+                putJsonObject("count") {
+                    put("type", "integer")
+                    put("description", "Maximum number of results (1-20, default 5)")
+                }
+            },
+            required = listOf("name"),
+        ),
+    ) { request ->
+        try {
+            val name = request.arguments?.get("name")?.jsonPrimitive?.contentOrNull
+                ?.trim()
+                ?.ifBlank { null }
+                ?: return@addTool errorResult("Error: 'name' parameter is required")
+            val count = request.arguments?.get("count")?.jsonPrimitive?.intOrNull ?: 5
+            val locations = searchLocations(name = name, count = count)
+            successResult(
+                json.encodeToString(
+                    SearchLocationResult(
+                        status = "ok",
+                        locations = locations,
+                    )
+                )
+            )
+        } catch (e: Exception) {
+            errorResult("Error searching location: ${e.message}")
+        }
+    }
+}
+
+private fun addGetForecastTool(server: Server) {
+    server.addTool(
+        name = "get_forecast",
+        description = "Get structured weather forecast data by coordinates. " +
+            "Supports up to 35 days and returns JSON suitable for summarization tools. " +
+            "For forecasts longer than 16 days, the server automatically switches to the ensemble endpoint. " +
+            "If the user also asked for a summary or file export, pass this raw JSON to the next specialized tool.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("latitude") {
+                    put("type", "number")
+                    put("description", "Latitude of the location")
+                }
+                putJsonObject("longitude") {
+                    put("type", "number")
+                    put("description", "Longitude of the location")
+                }
+                putJsonObject("forecast_days") {
+                    put("type", "integer")
+                    put("description", "Number of forecast days (1-35, default 7)")
+                }
+                putJsonObject("timezone") {
+                    put("type", "string")
+                    put("description", "Timezone for the response. Use auto or a concrete timezone id.")
+                }
+                putJsonObject("location_name") {
+                    put("type", "string")
+                    put("description", "Optional location name to include in the response payload")
+                }
+                putJsonObject("country") {
+                    put("type", "string")
+                    put("description", "Optional country name to include in the response payload")
+                }
+                putJsonObject("admin1") {
+                    put("type", "string")
+                    put("description", "Optional admin region to include in the response payload")
+                }
+            },
+            required = listOf("latitude", "longitude"),
+        ),
+    ) { request ->
+        try {
+            val latitude = request.arguments?.get("latitude")?.jsonPrimitive?.doubleOrNull
+                ?: return@addTool errorResult("Error: 'latitude' parameter is required")
+            val longitude = request.arguments?.get("longitude")?.jsonPrimitive?.doubleOrNull
+                ?: return@addTool errorResult("Error: 'longitude' parameter is required")
+            val forecastDays = request.arguments?.get("forecast_days")?.jsonPrimitive?.intOrNull ?: 7
+            val timezone = request.arguments?.get("timezone")?.jsonPrimitive?.contentOrNull
+                ?.trim()
+                ?.ifBlank { null }
+            val location = ResolvedLocation(
+                name = request.arguments?.get("location_name")?.jsonPrimitive?.contentOrNull,
+                country = request.arguments?.get("country")?.jsonPrimitive?.contentOrNull,
+                admin1 = request.arguments?.get("admin1")?.jsonPrimitive?.contentOrNull,
+                latitude = latitude,
+                longitude = longitude,
+                timezone = timezone,
+            )
+            val payload = fetchForecastPayload(
+                location = location,
+                forecastDays = forecastDays,
+                requestedTimezone = timezone,
+            )
+            successResult(json.encodeToString(payload))
+        } catch (e: Exception) {
+            errorResult("Error fetching forecast: ${e.message}")
+        }
+    }
+}
+
+private fun addGetCityForecastTool(server: Server) {
+    server.addTool(
+        name = "get_city_forecast",
+        description = "Get structured weather forecast data directly by city name. " +
+            "Use this for requests like 'weather in Paris for a month'. " +
+            "Returns JSON suitable for summarization and file-saving workflows. " +
+            "If the user also asked for a summary or file export, pass this raw JSON to the next specialized tool.",
+        inputSchema = ToolSchema(
+            properties = buildJsonObject {
+                putJsonObject("city_name") {
+                    put("type", "string")
+                    put("description", "City name, for example Paris")
+                }
+                putJsonObject("forecast_days") {
+                    put("type", "integer")
+                    put("description", "Number of forecast days (1-35, default 7)")
+                }
+                putJsonObject("timezone") {
+                    put("type", "string")
+                    put("description", "Optional timezone override. If omitted, the city's timezone is used when available.")
+                }
+            },
+            required = listOf("city_name"),
+        ),
+    ) { request ->
+        try {
+            val cityName = request.arguments?.get("city_name")?.jsonPrimitive?.contentOrNull
+                ?.trim()
+                ?.ifBlank { null }
+                ?: return@addTool errorResult("Error: 'city_name' parameter is required")
+            val forecastDays = request.arguments?.get("forecast_days")?.jsonPrimitive?.intOrNull ?: 7
+            val timezone = request.arguments?.get("timezone")?.jsonPrimitive?.contentOrNull
+                ?.trim()
+                ?.ifBlank { null }
+            val location = searchLocations(name = cityName, count = 1).firstOrNull()
+                ?: return@addTool errorResult("No locations found for '$cityName'.")
+            val payload = fetchForecastPayload(
+                location = location,
+                forecastDays = forecastDays,
+                requestedTimezone = timezone,
+            )
+            successResult(json.encodeToString(payload))
+        } catch (e: Exception) {
+            errorResult("Error fetching city forecast: ${e.message}")
+        }
+    }
+}
+
+private suspend fun searchLocations(
+    name: String,
+    count: Int
+): List<ResolvedLocation> {
+    val normalizedCount = count.coerceIn(1, 20)
+    val response = httpClient.get(GEOCODING_URL) {
+        parameter("name", name)
+        parameter("count", normalizedCount)
+        parameter("language", "en")
+        parameter("format", "json")
+    }
+    val body = json.parseToJsonElement(response.bodyAsText()).jsonObject
+    val results = body["results"]?.jsonArray.orEmpty()
+    return results.mapNotNull { item ->
+        val obj = item.jsonObject
+        val latitude = obj["latitude"]?.jsonPrimitive?.doubleOrNull ?: return@mapNotNull null
+        val longitude = obj["longitude"]?.jsonPrimitive?.doubleOrNull ?: return@mapNotNull null
+        ResolvedLocation(
+            name = obj["name"]?.jsonPrimitive?.contentOrNull,
+            country = obj["country"]?.jsonPrimitive?.contentOrNull,
+            admin1 = obj["admin1"]?.jsonPrimitive?.contentOrNull,
+            latitude = latitude,
+            longitude = longitude,
+            timezone = obj["timezone"]?.jsonPrimitive?.contentOrNull,
+        )
+    }
+}
+
+private suspend fun fetchForecastPayload(
+    location: ResolvedLocation,
+    forecastDays: Int,
+    requestedTimezone: String?
+): WeatherForecastPayload {
+    val normalizedDays = forecastDays.coerceIn(1, MAX_FORECAST_DAYS)
+    val timezone = requestedTimezone ?: location.timezone ?: "auto"
+    val useEnsembleEndpoint = normalizedDays > STANDARD_FORECAST_MAX_DAYS
+    val endpoint = if (useEnsembleEndpoint) ENSEMBLE_URL else FORECAST_URL
+
+    val response = httpClient.get(endpoint) {
+        parameter("latitude", location.latitude)
+        parameter("longitude", location.longitude)
+        parameter(
+            "daily",
+            "temperature_2m_max,temperature_2m_min,precipitation_sum,weather_code"
+        )
+        parameter("forecast_days", normalizedDays)
+        parameter("timezone", timezone)
+        if (!useEnsembleEndpoint) {
+            parameter(
+                "current",
+                "temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code"
+            )
+        }
+    }
+
+    val body = json.parseToJsonElement(response.bodyAsText()).jsonObject
+    val daily = buildDailyForecast(body)
+    val current = if (useEnsembleEndpoint) {
+        null
+    } else {
+        buildCurrentWeather(body)
+    }
+
+    return WeatherForecastPayload(
+        status = "ok",
+        sourceEndpoint = if (useEnsembleEndpoint) "ensemble" else "forecast",
+        forecastDays = normalizedDays,
+        timezone = body["timezone"]?.jsonPrimitive?.contentOrNull ?: timezone,
+        location = WeatherLocationPayload(
+            name = location.name,
+            country = location.country,
+            admin1 = location.admin1,
+            latitude = location.latitude,
+            longitude = location.longitude,
+            timezone = location.timezone ?: body["timezone"]?.jsonPrimitive?.contentOrNull,
+        ),
+        current = current,
+        daily = daily,
+    )
+}
+
+private fun buildCurrentWeather(body: kotlinx.serialization.json.JsonObject): CurrentWeatherPayload? {
+    val current = body["current"]?.jsonObject ?: return null
+    return CurrentWeatherPayload(
+        time = current["time"]?.jsonPrimitive?.contentOrNull,
+        temperature = current["temperature_2m"]?.jsonPrimitive?.doubleOrNull,
+        relativeHumidity = current["relative_humidity_2m"]?.jsonPrimitive?.intOrNull,
+        windSpeed = current["wind_speed_10m"]?.jsonPrimitive?.doubleOrNull,
+        weatherCode = current["weather_code"]?.jsonPrimitive?.intOrNull,
+        weatherDescription = current["weather_code"]?.jsonPrimitive?.intOrNull
+            ?.let(::weatherCodeToDescription),
+    )
+}
+
+private fun buildDailyForecast(body: kotlinx.serialization.json.JsonObject): List<DailyForecastPayload> {
+    val daily = body["daily"]?.jsonObject
+        ?: throw IllegalStateException("Forecast response does not contain 'daily' block")
+    val dates = daily["time"]?.jsonArray.orEmpty()
+    val maxTemps = daily["temperature_2m_max"]?.jsonArray.orEmpty()
+    val minTemps = daily["temperature_2m_min"]?.jsonArray.orEmpty()
+    val precipitation = daily["precipitation_sum"]?.jsonArray.orEmpty()
+    val weatherCodes = daily["weather_code"]?.jsonArray.orEmpty()
+
+    return dates.indices.mapNotNull { index ->
+        val date = dates.getOrNull(index)?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+        val weatherCode = weatherCodes.getOrNull(index)?.jsonPrimitive?.intOrNull ?: 0
+        DailyForecastPayload(
+            date = date,
+            weatherCode = weatherCode,
+            weatherDescription = weatherCodeToDescription(weatherCode),
+            temperatureMin = minTemps.getOrNull(index)?.jsonPrimitive?.doubleOrNull ?: 0.0,
+            temperatureMax = maxTemps.getOrNull(index)?.jsonPrimitive?.doubleOrNull ?: 0.0,
+            precipitationSum = precipitation.getOrNull(index)?.jsonPrimitive?.doubleOrNull ?: 0.0,
+        )
+    }
+}
+
+private fun weatherCodeToDescription(code: Int): String = when (code) {
     0 -> "Clear sky"
     1 -> "Mainly clear"
     2 -> "Partly cloudy"
@@ -63,215 +380,76 @@ fun weatherCodeToDescription(code: Int): String = when (code) {
     else -> "Unknown ($code)"
 }
 
-fun createServer(): Server {
-    val server = Server(
-        Implementation(
-            name = "weather-mcp-server",
-            version = "1.0.0",
-        ),
-        ServerOptions(
-            capabilities = ServerCapabilities(
-                tools = ServerCapabilities.Tools(listChanged = false),
-            ),
-        ),
+private fun successResult(payload: String): CallToolResult {
+    return CallToolResult(content = listOf(TextContent(payload)))
+}
+
+private fun errorResult(message: String): CallToolResult {
+    return CallToolResult(
+        content = listOf(TextContent(message)),
+        isError = true,
     )
-
-    // Tool: search_location
-    server.addTool(
-        name = "search_location",
-        description = "Search for a city by name and get its coordinates (latitude, longitude). " +
-            "Use this to find coordinates before requesting a weather forecast.",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putJsonObject("name") {
-                    put("type", "string")
-                    put("description", "City name to search for")
-                }
-                putJsonObject("count") {
-                    put("type", "integer")
-                    put("description", "Maximum number of results (1-100, default 5)")
-                }
-            },
-            required = listOf("name"),
-        ),
-    ) { request ->
-        try {
-            val name = request.arguments?.get("name")?.jsonPrimitive?.content
-                ?: return@addTool CallToolResult(
-                    content = listOf(TextContent("Error: 'name' parameter is required")),
-                    isError = true,
-                )
-            val count = request.arguments?.get("count")?.jsonPrimitive?.int ?: 5
-
-            val response = httpClient.get("https://geocoding-api.open-meteo.com/v1/search") {
-                parameter("name", name)
-                parameter("count", count)
-                parameter("language", "en")
-                parameter("format", "json")
-            }
-
-            val body = json.parseToJsonElement(response.bodyAsText()).jsonObject
-            val results = body["results"]?.jsonArray
-
-            if (results == null || results.isEmpty()) {
-                return@addTool CallToolResult(
-                    content = listOf(TextContent("No locations found for '$name'.")),
-                )
-            }
-
-            val sb = StringBuilder("Found ${results.size} location(s) for '$name':\n\n")
-            for ((i, item) in results.withIndex()) {
-                val obj = item.jsonObject
-                val cityName = obj["name"]?.jsonPrimitive?.content ?: "Unknown"
-                val country = obj["country"]?.jsonPrimitive?.content ?: ""
-                val admin1 = obj["admin1"]?.jsonPrimitive?.content
-                val lat = obj["latitude"]?.jsonPrimitive?.double
-                val lon = obj["longitude"]?.jsonPrimitive?.double
-                val elevation = obj["elevation"]?.jsonPrimitive?.double
-                val population = obj["population"]?.jsonPrimitive?.int
-                val timezone = obj["timezone"]?.jsonPrimitive?.content
-
-                sb.append("${i + 1}. $cityName")
-                if (admin1 != null) sb.append(", $admin1")
-                sb.append(", $country\n")
-                sb.append("   Coordinates: $lat, $lon\n")
-                if (elevation != null) sb.append("   Elevation: ${elevation}m\n")
-                if (population != null) sb.append("   Population: $population\n")
-                if (timezone != null) sb.append("   Timezone: $timezone\n")
-                sb.append("\n")
-            }
-
-            CallToolResult(content = listOf(TextContent(sb.toString().trimEnd())))
-        } catch (e: Exception) {
-            CallToolResult(
-                content = listOf(TextContent("Error searching location: ${e.message}")),
-                isError = true,
-            )
-        }
-    }
-
-    // Tool: get_forecast
-    server.addTool(
-        name = "get_forecast",
-        description = "Get current weather and daily forecast for a location by its coordinates. " +
-            "Use search_location first to find coordinates by city name.",
-        inputSchema = ToolSchema(
-            properties = buildJsonObject {
-                putJsonObject("latitude") {
-                    put("type", "number")
-                    put("description", "Latitude of the location")
-                }
-                putJsonObject("longitude") {
-                    put("type", "number")
-                    put("description", "Longitude of the location")
-                }
-                putJsonObject("forecast_days") {
-                    put("type", "integer")
-                    put("description", "Number of forecast days (1-16, default 7)")
-                }
-            },
-            required = listOf("latitude", "longitude"),
-        ),
-    ) { request ->
-        try {
-            val latitude = request.arguments?.get("latitude")?.jsonPrimitive?.double
-                ?: return@addTool CallToolResult(
-                    content = listOf(TextContent("Error: 'latitude' parameter is required")),
-                    isError = true,
-                )
-            val longitude = request.arguments?.get("longitude")?.jsonPrimitive?.double
-                ?: return@addTool CallToolResult(
-                    content = listOf(TextContent("Error: 'longitude' parameter is required")),
-                    isError = true,
-                )
-            val forecastDays = request.arguments?.get("forecast_days")?.jsonPrimitive?.int ?: 7
-
-            val response = httpClient.get("https://api.open-meteo.com/v1/forecast") {
-                parameter("latitude", latitude)
-                parameter("longitude", longitude)
-                parameter("current", "temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code")
-                parameter("daily", "temperature_2m_max,temperature_2m_min,precipitation_sum,weather_code")
-                parameter("forecast_days", forecastDays)
-                parameter("timezone", "auto")
-            }
-
-            val body = json.parseToJsonElement(response.bodyAsText()).jsonObject
-            val sb = StringBuilder()
-
-            // Current weather
-            val current = body["current"]?.jsonObject
-            val currentUnits = body["current_units"]?.jsonObject
-            if (current != null) {
-                val temp = current["temperature_2m"]?.jsonPrimitive?.double
-                val tempUnit = currentUnits?.get("temperature_2m")?.jsonPrimitive?.content ?: "°C"
-                val humidity = current["relative_humidity_2m"]?.jsonPrimitive?.int
-                val humidityUnit = currentUnits?.get("relative_humidity_2m")?.jsonPrimitive?.content ?: "%"
-                val windSpeed = current["wind_speed_10m"]?.jsonPrimitive?.double
-                val windUnit = currentUnits?.get("wind_speed_10m")?.jsonPrimitive?.content ?: "km/h"
-                val weatherCode = current["weather_code"]?.jsonPrimitive?.int ?: 0
-                val time = current["time"]?.jsonPrimitive?.content
-
-                sb.append("=== Current Weather ===\n")
-                if (time != null) sb.append("Time: $time\n")
-                sb.append("Condition: ${weatherCodeToDescription(weatherCode)}\n")
-                sb.append("Temperature: $temp $tempUnit\n")
-                sb.append("Humidity: $humidity $humidityUnit\n")
-                sb.append("Wind Speed: $windSpeed $windUnit\n")
-                sb.append("\n")
-            }
-
-            // Daily forecast
-            val daily = body["daily"]?.jsonObject
-            val dailyUnits = body["daily_units"]?.jsonObject
-            if (daily != null) {
-                val times = daily["time"]?.jsonArray
-                val maxTemps = daily["temperature_2m_max"]?.jsonArray
-                val minTemps = daily["temperature_2m_min"]?.jsonArray
-                val precipitations = daily["precipitation_sum"]?.jsonArray
-                val weatherCodes = daily["weather_code"]?.jsonArray
-                val tempUnit = dailyUnits?.get("temperature_2m_max")?.jsonPrimitive?.content ?: "°C"
-                val precipUnit = dailyUnits?.get("precipitation_sum")?.jsonPrimitive?.content ?: "mm"
-
-                if (times != null) {
-                    sb.append("=== ${times.size}-Day Forecast ===\n")
-                    for (i in times.indices) {
-                        val date = times[i].jsonPrimitive.content
-                        val maxTemp = maxTemps?.get(i)?.jsonPrimitive?.double
-                        val minTemp = minTemps?.get(i)?.jsonPrimitive?.double
-                        val precip = precipitations?.get(i)?.jsonPrimitive?.double
-                        val code = weatherCodes?.get(i)?.jsonPrimitive?.int ?: 0
-
-                        sb.append("\n$date — ${weatherCodeToDescription(code)}\n")
-                        sb.append("  Temperature: $minTemp / $maxTemp $tempUnit\n")
-                        sb.append("  Precipitation: $precip $precipUnit\n")
-                    }
-                }
-            }
-
-            CallToolResult(content = listOf(TextContent(sb.toString().trimEnd())))
-        } catch (e: Exception) {
-            CallToolResult(
-                content = listOf(TextContent("Error fetching forecast: ${e.message}")),
-                isError = true,
-            )
-        }
-    }
-
-    return server
 }
 
-fun main() {
-    val host = System.getenv("MCP_HOST")?.trim()?.ifBlank { null } ?: "127.0.0.1"
-    val port = System.getenv("MCP_PORT")
-        ?.trim()
-        ?.toIntOrNull()
-        ?.takeIf { it in 1..65535 }
-        ?: 3001
+@Serializable
+private data class SearchLocationResult(
+    val status: String,
+    val locations: List<ResolvedLocation>,
+)
 
-    println("Starting Weather MCP Server on http://$host:$port/mcp")
+@Serializable
+private data class ResolvedLocation(
+    val name: String? = null,
+    val country: String? = null,
+    val admin1: String? = null,
+    val latitude: Double,
+    val longitude: Double,
+    val timezone: String? = null,
+)
 
-    embeddedServer(CIO, host = host, port = port) {
-        install(ContentNegotiation) { json(McpJson) }
-        mcpStreamableHttp { createServer() }
-    }.start(wait = true)
-}
+@Serializable
+private data class WeatherForecastPayload(
+    val status: String,
+    val sourceEndpoint: String,
+    val forecastDays: Int,
+    val timezone: String,
+    val location: WeatherLocationPayload,
+    val current: CurrentWeatherPayload? = null,
+    val daily: List<DailyForecastPayload>,
+)
+
+@Serializable
+private data class WeatherLocationPayload(
+    val name: String? = null,
+    val country: String? = null,
+    val admin1: String? = null,
+    val latitude: Double,
+    val longitude: Double,
+    val timezone: String? = null,
+)
+
+@Serializable
+private data class CurrentWeatherPayload(
+    val time: String? = null,
+    val temperature: Double? = null,
+    val relativeHumidity: Int? = null,
+    val windSpeed: Double? = null,
+    val weatherCode: Int? = null,
+    val weatherDescription: String? = null,
+)
+
+@Serializable
+private data class DailyForecastPayload(
+    val date: String,
+    val weatherCode: Int,
+    val weatherDescription: String,
+    val temperatureMin: Double,
+    val temperatureMax: Double,
+    val precipitationSum: Double,
+)
+
+private const val GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
+private const val FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+private const val ENSEMBLE_URL = "https://api.open-meteo.com/v1/ensemble"
+private const val STANDARD_FORECAST_MAX_DAYS = 16
+private const val MAX_FORECAST_DAYS = 35
